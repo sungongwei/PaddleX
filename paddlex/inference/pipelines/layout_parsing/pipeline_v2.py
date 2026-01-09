@@ -1069,6 +1069,9 @@ class _LayoutParsingPipelineV2(BasePipeline):
                 overall_ocr_res["rec_labels"] = ["text"] * len(
                     overall_ocr_res["rec_texts"]
                 )
+                for i, rec_text in enumerate(overall_ocr_res["rec_texts"]):
+                    if  rec_text == "":
+                        overall_ocr_res["rec_texts"][i] = "手写文字"
 
             if model_settings["use_table_recognition"]:
                 table_res_lists = []
@@ -1140,7 +1143,6 @@ class _LayoutParsingPipelineV2(BasePipeline):
                             )
                         table_contents_for_img["rec_polys"].append(poly_points)
                         table_contents_for_img["rec_scores"].append(img["score"])
-
                     table_res_all = list(
                         self.table_recognition_pipeline(
                             doc_preprocessor_image,

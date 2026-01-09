@@ -147,7 +147,7 @@ def compute_inter(rec1, rec2):
     return iou
 
 
-def match_table_and_ocr(cell_box_list, ocr_dt_boxes, table_cells_flag, row_start_index):
+def match_table_and_ocr(cell_box_list, ocr_dt_boxes, table_cells_flag, row_start_index,ocr_texts_res):
     """
     match table and ocr
 
@@ -172,7 +172,10 @@ def match_table_and_ocr(cell_box_list, ocr_dt_boxes, table_cells_flag, row_start
                     np.max(table_box[1::2]),
                 ]
             for j, ocr_box in enumerate(np.array(ocr_dt_boxes)):
-                if compute_inter(table_box, ocr_box) > 0.7:
+                score = compute_inter(table_box, ocr_box)
+                if(score != 0 and score != 1):
+                  print(f"table_box: {table_box}, ocr_box: {ocr_box} , rec_text: {ocr_texts_res[j]}, inter: {compute_inter(table_box, ocr_box)}")
+                if compute_inter(table_box, ocr_box) > 0.5:
                     if i not in matched.keys():
                         matched[i] = [j]
                     else:
@@ -473,7 +476,7 @@ def get_table_recognition_res(
     table_cells_flag.append(len(table_cells_result))
     row_start_index.append(len(table_cells_result))
     matched_index = match_table_and_ocr(
-        table_cells_result, ocr_dt_boxes, table_cells_flag, table_cells_flag
+        table_cells_result, ocr_dt_boxes, table_cells_flag, table_cells_flag,ocr_texts_res
     )
     pred_html = get_html_result(
         matched_index, ocr_texts_res, table_structure_result, row_start_index

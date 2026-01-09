@@ -197,11 +197,11 @@ class _SealRecognitionPipeline(BasePipeline):
         model_settings = self.get_model_settings(
             use_doc_orientation_classify, use_doc_unwarping, use_layout_detection
         )
-
         if not self.check_model_settings_valid(model_settings, layout_det_res):
             yield {"error": "the input params for model settings are invalid!"}
 
         external_layout_det_results = layout_det_res
+        doc_preprocessor_results=[]
         if external_layout_det_results is not None:
             if not isinstance(external_layout_det_results, list):
                 external_layout_det_results = [external_layout_det_results]
@@ -210,25 +210,48 @@ class _SealRecognitionPipeline(BasePipeline):
         for _, batch_data in enumerate(self.batch_sampler(input)):
             image_arrays = self.img_reader(batch_data.instances)
 
-            if model_settings["use_doc_preprocessor"]:
-                doc_preprocessor_results = list(
-                    self.doc_preprocessor_pipeline(
+            # 1. 布局检测印章（在原始图像上）
+            if model_settings["use_layout_detection"]:
+                layout_det_results = list(
+                    self.layout_det_model(
                         image_arrays,
-                        use_doc_orientation_classify=use_doc_orientation_classify,
-                        use_doc_unwarping=use_doc_unwarping,
+                        threshold=layout_threshold,
+                        layout_nms=layout_nms,
+                        layout_unclip_ratio=layout_unclip_ratio,
+                        layout_merge_bboxes_mode=layout_merge_bboxes_mode,
                     )
                 )
+            elif external_layout_det_results is not None:
+                layout_det_results = []
+                for _ in image_arrays:
+                    try:
+                        layout_det_res = next(external_layout_det_results)
+                    except StopIteration:
+                        raise ValueError("No more layout det results")
+                    layout_det_results.append(layout_det_res)
             else:
-                doc_preprocessor_results = [{"output_img": arr} for arr in image_arrays]
-
-            doc_preprocessor_images = [
-                item["output_img"] for item in doc_preprocessor_results
-            ]
+                layout_det_results = [{} for _ in image_arrays]
 
             if (
                 not model_settings["use_layout_detection"]
                 and external_layout_det_results is None
             ):
+                # 没有布局检测时的处理
+                if model_settings["use_doc_preprocessor"]:
+                    doc_preprocessor_results = list(
+                        self.doc_preprocessor_pipeline(
+                            image_arrays,
+                            use_doc_orientation_classify=use_doc_orientation_classify,
+                            use_doc_unwarping=use_doc_unwarping,
+                        )
+                    )
+                else:
+                    doc_preprocessor_results = [{"output_img": arr} for arr in image_arrays]
+
+                doc_preprocessor_images = [
+                    item["output_img"] for item in doc_preprocessor_results
+                ]
+                
                 layout_det_results = [{} for _ in doc_preprocessor_images]
                 flat_seal_results = list(
                     self.seal_ocr_pipeline(
@@ -245,61 +268,71 @@ class _SealRecognitionPipeline(BasePipeline):
                     seal_res["seal_region_id"] = 1
                 seal_results = [[item] for item in flat_seal_results]
             else:
-                if model_settings["use_layout_detection"]:
-                    layout_det_results = list(
-                        self.layout_det_model(
-                            doc_preprocessor_images,
-                            threshold=layout_threshold,
-                            layout_nms=layout_nms,
-                            layout_unclip_ratio=layout_unclip_ratio,
-                            layout_merge_bboxes_mode=layout_merge_bboxes_mode,
-                        )
-                    )
-                else:
-                    layout_det_results = []
-                    for _ in doc_preprocessor_images:
-                        try:
-                            layout_det_res = list(external_layout_det_results)[0]
-                        except StopIteration:
-                            raise ValueError("No more layout det results")
-                        layout_det_results.append(layout_det_res)
-
-                cropped_imgs = []
-                chunk_indices = [0]
-                for doc_preprocessor_image, layout_det_res in zip(
-                    doc_preprocessor_images, layout_det_results
-                ):
+                # 2. 遍历所有印章区域
+                seal_results = []
+                for image_array, layout_det_res in zip(image_arrays, layout_det_results):
+                    seal_results_for_img = []
+                    seal_region_id = 1
+                    
                     for box_info in layout_det_res["boxes"]:
                         if box_info["label"].lower() in ["seal"]:
-                            crop_img_info = self._crop_by_boxes(
-                                doc_preprocessor_image, [box_info]
+                            # 3. 文档处理每一个印章
+                            if model_settings["use_doc_preprocessor"]:
+                                # 裁剪印章区域
+                                crop_img_info = self._crop_by_boxes(image_array, [box_info])
+                                crop_img = crop_img_info[0]["img"]
+                                
+                                # 对裁剪的印章区域进行文档预处理
+                                doc_preprocessor_result = list(
+                                    self.doc_preprocessor_pipeline(
+                                        [crop_img],
+                                        use_doc_orientation_classify=use_doc_orientation_classify,
+                                        use_doc_unwarping=use_doc_unwarping,
+                                    )
+                                )
+                                doc_preprocessor_results.append(doc_preprocessor_result[0])
+                                processed_seal_img = doc_preprocessor_result[0]["output_img"]
+                            else:
+                                # 裁剪印章区域
+                                crop_img_info = self._crop_by_boxes(image_array, [box_info])
+                                processed_seal_img = crop_img_info[0]["img"]
+                            
+                            # 4. 印章识别
+                            seal_ocr_result = list(
+                                self.seal_ocr_pipeline(
+                                    [processed_seal_img],
+                                    text_det_limit_side_len=seal_det_limit_side_len,
+                                    text_det_limit_type=seal_det_limit_type,
+                                    text_det_thresh=seal_det_thresh,
+                                    text_det_box_thresh=seal_det_box_thresh,
+                                    text_det_unclip_ratio=seal_det_unclip_ratio,
+                                    text_rec_score_thresh=seal_rec_score_thresh,
+                                )
                             )
-                            crop_img_info = crop_img_info[0]
-                            cropped_imgs.append(crop_img_info["img"])
-                    chunk_indices.append(len(cropped_imgs))
+                            
+                            if seal_ocr_result:
+                                seal_res = seal_ocr_result[0]
+                                seal_res["seal_region_id"] = seal_region_id
+                                seal_results_for_img.append(seal_res)
+                                seal_region_id += 1
+                    
+                    seal_results.append(seal_results_for_img)
 
-                flat_seal_results = list(
-                    self.seal_ocr_pipeline(
-                        cropped_imgs,
-                        text_det_limit_side_len=seal_det_limit_side_len,
-                        text_det_limit_type=seal_det_limit_type,
-                        text_det_thresh=seal_det_thresh,
-                        text_det_box_thresh=seal_det_box_thresh,
-                        text_det_unclip_ratio=seal_det_unclip_ratio,
-                        text_rec_score_thresh=seal_rec_score_thresh,
-                    )
-                )
+            # 构建文档预处理结果用于返回（保持兼容性）
+            # if model_settings["use_doc_preprocessor"]:
+            #     doc_preprocessor_results = list(
+            #         self.doc_preprocessor_pipeline(
+            #             image_arrays,
+            #             use_doc_orientation_classify=use_doc_orientation_classify,
+            #             use_doc_unwarping=use_doc_unwarping,
+            #         )
+            #     )
+            # else:
+            #     doc_preprocessor_results = [{"output_img": arr} for arr in image_arrays]
 
-                seal_results = [
-                    flat_seal_results[i:j]
-                    for i, j in zip(chunk_indices[:-1], chunk_indices[1:])
-                ]
-
-                for seal_results_for_img in seal_results:
-                    seal_region_id = 1
-                    for seal_res in seal_results_for_img:
-                        seal_res["seal_region_id"] = seal_region_id
-                        seal_region_id += 1
+            # 确保 seal_results 和 image_arrays 长度匹配
+            if len(seal_results) < len(image_arrays):
+                seal_results.extend([[] for _ in range(len(image_arrays) - len(seal_results))])
 
             for (
                 input_path,
